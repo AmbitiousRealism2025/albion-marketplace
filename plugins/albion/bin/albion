@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+warn_without_charter() {
+  printf '%s\n' 'WARNING: running without the orchestration charter' >&2
+}
+
+warn_without_plugin() {
+  printf '%s\n' 'WARNING: running without the Albion plugin directory' >&2
+}
+
+resolve_script_dir() {
+  local source_path
+  local source_dir
+
+  source_path="${BASH_SOURCE[0]}"
+  while [ -h "$source_path" ]; do
+    source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+    source_path="$(readlink "$source_path")"
+    case "$source_path" in
+      /*) ;;
+      *) source_path="${source_dir}/${source_path}" ;;
+    esac
+  done
+
+  cd -P "$(dirname "$source_path")" && pwd
+}
+
+quote_argv() {
+  local arg
+  for arg in "$@"; do
+    printf ' %q' "$arg"
+  done
+  printf '\n'
+}
+
+print_dry_run() {
+  local token_state
+  local charter_display
+
+  if [ -n "${ANTHROPIC_AUTH_TOKEN+x}" ] && [ -n "${ANTHROPIC_AUTH_TOKEN}" ]; then
+    token_state="***set***"
+  else
+    token_state="***unset***"
+  fi
+
+  if [ -n "$charter_path" ]; then
+    charter_display="$charter_path"
+  else
+    charter_display="(none)"
+  fi
+
+  printf 'mode=%s\n' "$mode"
+  printf 'auth_lane=%s\n' "${ALBION_AUTH_LANE:-}"
+  printf 'anthropic_auth_token=%s\n' "$token_state"
+  printf 'opus_model=%s\n' "${ANTHROPIC_DEFAULT_OPUS_MODEL:-}"
+  printf 'sonnet_model=%s\n' "${ANTHROPIC_DEFAULT_SONNET_MODEL:-}"
+  printf 'haiku_model=%s\n' "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}"
+  printf 'model=%s\n' "$resolved_model"
+  printf 'charter=%s\n' "$charter_display"
+  printf 'final_argv='
+  quote_argv "${final_argv[@]}"
+}
+
+parse_args() {
+  passthrough=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --vanilla)
+        mode="vanilla"
+        ;;
+      --doctor)
+        doctor_requested=1
+        ;;
+      --dry-run)
+        dry_run=1
+        ;;
+      --albion-*)
+        printf 'unknown Albion flag: %s\n' "$1" >&2
+        exit 4
+        ;;
+      *)
+        passthrough+=("$1")
+        ;;
+    esac
+    shift
+  done
+}
+
+source_albion_env() {
+  if [ ! -f "$env_script" ]; then
+    printf 'env sourcing failed: %s not found\n' "$env_script" >&2
+    return 1
+  fi
+
+  # shellcheck source=env/albion-env.sh
+  if ! . "$env_script"; then
+    return 1
+  fi
+}
+
+passthrough_model_value() {
+  local i
+  local arg
+  local next_index
+
+  for i in "${!passthrough[@]}"; do
+    arg="${passthrough[$i]}"
+    case "$arg" in
+      --model)
+        next_index=$((i + 1))
+        if [ "$next_index" -lt "${#passthrough[@]}" ]; then
+          printf '%s\n' "${passthrough[$next_index]}"
+        fi
+        return 0
+        ;;
+      --model=*)
+        printf '%s\n' "${arg#--model=}"
+        return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+resolve_model() {
+  if resolved_model="$(passthrough_model_value)"; then
+    model_injected=0
+  else
+    resolved_model="${ALBION_MODEL:-glm-5.2[1m]}"
+    model_injected=1
+  fi
+}
+
+resolve_charter() {
+  local candidate
+
+  if [ "$mode" = "vanilla" ]; then
+    charter_path=""
+    return 0
+  fi
+
+  candidate="${ALBION_CHARTER:-${repo_root}/charter/ALBION.md}"
+  if [ -f "$candidate" ]; then
+    charter_path="$(cd -P "$(dirname "$candidate")" && pwd)/$(basename "$candidate")"
+  else
+    charter_path=""
+    warn_without_charter
+  fi
+}
+
+resolve_plugin_dir() {
+  local candidate
+
+  if [ "$mode" = "vanilla" ]; then
+    plugin_dir=""
+    return 0
+  fi
+
+  # Self-contained install: the launcher lives inside the plugin directory
+  # itself (repo_root IS the plugin root), as produced by bin/albion-package
+  # for marketplace distribution.
+  if [ -f "${repo_root}/.claude-plugin/plugin.json" ]; then
+    plugin_dir="$repo_root"
+    return 0
+  fi
+
+  # Dev / clone layout: the plugin is a subdirectory of the repo.
+  candidate="${repo_root}/plugin"
+  if [ -d "$candidate" ]; then
+    plugin_dir="$(cd -P "$candidate" && pwd)"
+  else
+    plugin_dir=""
+    warn_without_plugin
+  fi
+}
+
+resolve_settings() {
+  local candidate
+
+  # Scope Albion's effort default (xhigh -> GLM-max) to albion sessions via a
+  # merged --settings layer, so it never dictates the user's stock-claude effort.
+  # Default mode only; vanilla stays bare and uses the ambient default.
+  if [ "$mode" = "vanilla" ]; then
+    settings_path=""
+    return 0
+  fi
+
+  candidate="${repo_root}/config/albion-settings.json"
+  if [ -f "$candidate" ]; then
+    settings_path="$(cd -P "$(dirname "$candidate")" && pwd)/$(basename "$candidate")"
+  else
+    settings_path=""
+  fi
+}
+
+build_final_argv() {
+  final_argv=("claude")
+
+  # The control arm must be genuinely bare: without this, user-scope skills
+  # (e.g. a globally installed fable-mode) auto-load and contaminate the A/B
+  # baseline — the exact confound found in the first long-horizon diagnostic.
+  if [ "$mode" = "vanilla" ]; then
+    final_argv+=("--disable-slash-commands")
+  fi
+
+  if [ -n "$charter_path" ]; then
+    final_argv+=("--append-system-prompt" "$(cat "$charter_path")")
+  fi
+
+  if [ -n "$plugin_dir" ]; then
+    final_argv+=("--plugin-dir" "$plugin_dir")
+  fi
+
+  if [ -n "$settings_path" ]; then
+    final_argv+=("--settings" "$settings_path")
+  fi
+
+  if [ "$model_injected" -eq 1 ]; then
+    final_argv+=("--model" "$resolved_model")
+  fi
+
+  if [ "${#passthrough[@]}" -gt 0 ]; then
+    final_argv+=("${passthrough[@]}")
+  fi
+}
+
+main() {
+  local script_dir
+  local repo_root
+  local env_script
+  local doctor_script
+  local mode
+  local doctor_requested
+  local dry_run
+  local charter_path
+  local plugin_dir
+  local settings_path
+  local resolved_model
+  local model_injected
+  local -a passthrough
+  local -a final_argv
+
+  script_dir="$(resolve_script_dir)"
+  repo_root="$(cd "${script_dir}/.." && pwd)"
+  env_script="${repo_root}/env/albion-env.sh"
+  doctor_script="${repo_root}/bin/albion-doctor"
+  mode="default"
+  doctor_requested=0
+  dry_run=0
+  charter_path=""
+  plugin_dir=""
+  settings_path=""
+  resolved_model=""
+  model_injected=0
+  passthrough=()
+  final_argv=()
+
+  parse_args "$@"
+
+  if [ "$doctor_requested" -eq 1 ]; then
+    if [ -x "$doctor_script" ]; then
+      exec "$doctor_script" "${passthrough[@]}"
+    fi
+    printf '%s\n' 'doctor not installed yet' >&2
+    exit 3
+  fi
+
+  if ! source_albion_env; then
+    exit 1
+  fi
+
+  case "$mode" in
+    default) export CLAUDE_AGENT_NAME="Albion" ;;
+    vanilla) export CLAUDE_AGENT_NAME="Albion-vanilla" ;;
+  esac
+
+  resolve_model
+  resolve_charter
+  resolve_plugin_dir
+  resolve_settings
+  # Mark the session Albion-active only when the plugin is actually loaded.
+  # The plugin's hooks gate on this marker, so a globally-enabled Albion plugin
+  # stays inert in stock `claude` sessions and in `albion --vanilla` (both leave
+  # plugin_dir empty), giving clean coexistence with stock Claude Code.
+  if [ -n "$plugin_dir" ]; then
+    export ALBION_ACTIVE=1
+  fi
+  build_final_argv
+
+  if [ "$dry_run" -eq 1 ]; then
+    print_dry_run
+    return 0
+  fi
+
+  if ! command -v claude >/dev/null 2>&1; then
+    printf '%s\n' 'claude binary not found on PATH; install Claude Code or add claude to PATH before running bin/albion.' >&2
+    exit 2
+  fi
+
+  exec "${final_argv[@]}"
+}
+
+main "$@"

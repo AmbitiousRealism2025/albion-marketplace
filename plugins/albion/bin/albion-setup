@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Interactive credential setup for Albion. Prompts for a Z.ai token (input
+# hidden), writes it to a mode-600 secrets file, and prints the one line to add
+# to your shell profile. Never echoes, logs, or transmits a token. Covers the
+# metered case where GLM-4.6V vision uses a separate key from the main model.
+#
+# Usage: bin/albion-setup [--secrets-file PATH] [--help]
+
+secrets_file="${HOME:-}/.albion/secrets.sh"
+
+print_usage() {
+  cat <<'USAGE'
+Usage: bin/albion-setup [--secrets-file PATH] [--help]
+
+Interactively configure Albion's Z.ai credentials. Writes a mode-600 secrets
+file (default: ~/.albion/secrets.sh) with the appropriate export lines and
+prints the shell-profile line to load it. Tokens are never echoed or logged.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --secrets-file)
+      [ "$#" -ge 2 ] || { printf '%s\n' '--secrets-file requires a path' >&2; exit 2; }
+      secrets_file="$2"; shift 2 ;;
+    --secrets-file=*) secrets_file="${1#--secrets-file=}"; shift ;;
+    --help) print_usage; exit 0 ;;
+    *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$secrets_file" ]; then
+  printf 'ERROR: no secrets file path (HOME unset?); pass --secrets-file PATH\n' >&2
+  exit 1
+fi
+
+ask() { printf '%s' "$1" >&2; }
+
+read_hidden() {
+  # Read one line silently into the named variable.
+  IFS= read -rs "$1" || true
+  printf '\n' >&2
+}
+
+ask 'Auth lane — [plan] subscription token, or [api] metered key? (plan/api) [plan]: '
+IFS= read -r lane || true
+lane="${lane:-plan}"
+case "$lane" in
+  plan|api) ;;
+  *) printf 'ERROR: lane must be "plan" or "api"\n' >&2; exit 1 ;;
+esac
+
+ask "Paste your Z.ai ${lane} token (hidden): "
+read_hidden token
+if [ -z "${token:-}" ]; then
+  printf 'ERROR: no token entered; nothing written.\n' >&2
+  exit 1
+fi
+
+vision_token=""
+vision_lane=""
+ask 'Use a SEPARATE GLM-4.6V vision key (e.g. metered main model, plan-lane vision)? (y/N): '
+IFS= read -r want_vision || true
+case "${want_vision:-}" in
+  y|Y|yes|YES)
+    ask 'Paste your GLM-4.6V vision token (hidden): '
+    read_hidden vision_token
+    ask 'Vision lane? (plan/api) [same as main]: '
+    IFS= read -r vision_lane || true
+    case "${vision_lane:-}" in
+      ""|plan|api) ;;
+      *) printf 'ERROR: vision lane must be "plan" or "api"\n' >&2; exit 1 ;;
+    esac
+    ;;
+esac
+
+ALBION_SETUP_LANE="$lane" \
+ALBION_SETUP_TOKEN="$token" \
+ALBION_SETUP_VTOKEN="${vision_token:-}" \
+ALBION_SETUP_VLANE="${vision_lane:-}" \
+ALBION_SETUP_FILE="$secrets_file" \
+python3 <<'PY'
+import os, pathlib, shlex, tempfile
+
+path = pathlib.Path(os.environ["ALBION_SETUP_FILE"])
+path.parent.mkdir(parents=True, exist_ok=True)
+try:
+    path.parent.chmod(0o700)
+except OSError:
+    pass
+
+lane = os.environ.get("ALBION_SETUP_LANE", "")
+token = os.environ.get("ALBION_SETUP_TOKEN", "")
+vtoken = os.environ.get("ALBION_SETUP_VTOKEN", "")
+vlane = os.environ.get("ALBION_SETUP_VLANE", "")
+
+lines = ["# Albion credentials written by albion-setup. Do NOT commit this file.\n"]
+lines.append("export ALBION_AUTH_LANE=%s\n" % shlex.quote(lane))
+main_var = "ALBION_ZAI_API_KEY" if lane == "api" else "ALBION_ZAI_TOKEN"
+lines.append("export %s=%s\n" % (main_var, shlex.quote(token)))
+if vtoken:
+    lines.append("export ALBION_VISION_TOKEN=%s\n" % shlex.quote(vtoken))
+if vlane:
+    lines.append("export ALBION_VISION_LANE=%s\n" % shlex.quote(vlane))
+
+fd, tmp = tempfile.mkstemp(dir=str(path.parent))
+try:
+    os.write(fd, "".join(lines).encode("utf-8"))
+finally:
+    os.close(fd)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+
+printf 'Saved Albion credentials to %s (mode 600).\n' "$secrets_file"
+printf 'Load them by adding this line to your shell profile (e.g. ~/.zshrc):\n'
+printf '  [ -r %q ] && source %q\n' "$secrets_file" "$secrets_file"
+printf 'Then open a new terminal (or source the file) and run: albion-doctor --live\n'

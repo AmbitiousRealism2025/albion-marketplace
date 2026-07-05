@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final, NoReturn, TypeAlias
+
+import fcntl
+
+JsonScalar: TypeAlias = str | int | float | bool | None
+JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+JsonObject: TypeAlias = dict[str, JsonValue]
+
+USAGE: Final = (
+    "Usage: albion-state <get|set|incr|del|dump> --file <path> "
+    "[--key <dotted.key>] [--value <v>] [--default <v>]"
+)
+VERBS: Final = {"get", "set", "incr", "del", "dump"}
+FLAG_NAMES: Final = {"--file", "--key", "--value", "--default"}
+
+
+@dataclass(frozen=True, slots=True)
+class Args:
+    verb: str
+    file_path: Path
+    key: str | None
+    value: str | None
+    default: str | None
+
+
+class UsageFailure(Exception):
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class CorruptStateFailure(Exception):
+    def __init__(self, file_path: Path, detail: str) -> None:
+        self.file_path = file_path
+        self.detail = detail
+        super().__init__(detail)
+
+
+class OperationFailure(Exception):
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+def usage(message: str) -> NoReturn:
+    print(f"{message}\n{USAGE}", file=sys.stderr)
+    raise SystemExit(64)
+
+
+def parse_args(argv: list[str]) -> Args:
+    if not argv:
+        usage("missing command")
+
+    verb = argv[0]
+    if verb not in VERBS:
+        usage(f"unknown command: {verb}")
+
+    flags: dict[str, str] = {}
+    index = 1
+    while index < len(argv):
+        flag = argv[index]
+        if flag not in FLAG_NAMES:
+            usage(f"unknown flag: {flag}")
+        if flag in flags:
+            usage(f"duplicate flag: {flag}")
+        if index + 1 >= len(argv):
+            usage(f"missing value for {flag}")
+        flags[flag] = argv[index + 1]
+        index += 2
+
+    file_value = flags.get("--file")
+    key = flags.get("--key")
+    value = flags.get("--value")
+    default = flags.get("--default")
+
+    if file_value is None:
+        usage("missing --file")
+    if verb in {"get", "set", "incr", "del"} and key is None:
+        usage(f"{verb} requires --key")
+    if verb == "set" and value is None:
+        usage("set requires --value")
+    if verb != "get" and default is not None:
+        usage("--default is only valid with get")
+    if verb == "dump" and (key is not None or value is not None):
+        usage("dump does not accept --key or --value")
+    if key is not None and key_parts(key) is None:
+        usage(f"invalid dotted key: {key}")
+
+    return Args(verb=verb, file_path=Path(file_value), key=key, value=value, default=default)
+
+
+def key_parts(key: str) -> list[str] | None:
+    parts = key.split(".")
+    if not key or any(part == "" for part in parts):
+        return None
+    return parts
+
+
+def parse_value(raw_value: str) -> JsonValue:
+    try:
+        loaded = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return raw_value
+    return loaded
+
+
+def read_state(file_path: Path) -> JsonObject:
+    if not file_path.exists():
+        return {}
+    try:
+        with file_path.open("r", encoding="utf-8") as state_file:
+            loaded = json.load(state_file)
+    except json.JSONDecodeError as error:
+        raise CorruptStateFailure(file_path, str(error)) from error
+    except OSError as error:
+        raise OperationFailure(f"cannot read {file_path}: {error}") from error
+    if not isinstance(loaded, dict):
+        raise CorruptStateFailure(file_path, "top-level JSON value is not an object")
+    return loaded
+
+
+def write_state(file_path: Path, data: JsonObject) -> None:
+    parent = file_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    temp_path = ""
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=f".{file_path.name}.", suffix=".tmp", dir=parent, text=True)
+        os.chmod(temp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            json.dump(data, temp_file, indent=2, sort_keys=True)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, file_path)
+    except OSError as error:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+        raise OperationFailure(f"cannot write {file_path}: {error}") from error
+
+
+def get_value(data: JsonObject, key: str) -> tuple[bool, JsonValue]:
+    current: JsonValue = data
+    parts = key_parts(key)
+    if parts is None:
+        raise OperationFailure(f"invalid dotted key: {key}")
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
+
+
+def set_value(data: JsonObject, key: str, value: JsonValue) -> None:
+    current = data
+    parts = key_parts(key)
+    if parts is None:
+        raise OperationFailure(f"invalid dotted key: {key}")
+    for part in parts[:-1]:
+        next_value = current.get(part)
+        if not isinstance(next_value, dict):
+            next_value = {}
+            current[part] = next_value
+        current = next_value
+    current[parts[-1]] = value
+
+
+def delete_value(data: JsonObject, key: str) -> None:
+    current: JsonValue = data
+    parts = key_parts(key)
+    if parts is None:
+        raise OperationFailure(f"invalid dotted key: {key}")
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return
+        current = current[part]
+    if isinstance(current, dict):
+        current.pop(parts[-1], None)
+
+
+def format_value(value: JsonValue) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, separators=(",", ":"))
+
+
+def increment_value(data: JsonObject, key: str, raw_step: str | None) -> int:
+    step_value: JsonValue = 1 if raw_step is None else parse_value(raw_step)
+    if not isinstance(step_value, int) or isinstance(step_value, bool):
+        raise UsageFailure("incr --value must be an integer")
+    found, existing = get_value(data, key)
+    if not found:
+        next_value = step_value
+    elif isinstance(existing, int) and not isinstance(existing, bool):
+        next_value = existing + step_value
+    else:
+        raise OperationFailure(f"{key} is not an integer")
+    set_value(data, key, next_value)
+    return next_value
+
+
+def lock_file_path(file_path: Path) -> Path:
+    return file_path.with_name(f"{file_path.name}.lock")
+
+
+def mutate(args: Args) -> None:
+    args.file_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_file_path(args.file_path).open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        data = read_state(args.file_path)
+        match args.verb:
+            case "set":
+                if args.key is None or args.value is None:
+                    raise UsageFailure("set requires --key and --value")
+                set_value(data, args.key, parse_value(args.value))
+            case "incr":
+                if args.key is None:
+                    raise UsageFailure("incr requires --key")
+                print(increment_value(data, args.key, args.value))
+            case "del":
+                if args.key is None:
+                    raise UsageFailure("del requires --key")
+                delete_value(data, args.key)
+            case unreachable:
+                usage(f"unsupported write command: {unreachable}")
+        write_state(args.file_path, data)
+
+
+def read_command(args: Args) -> None:
+    if args.file_path.exists():
+        with lock_file_path(args.file_path).open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+            data = read_state(args.file_path)
+    else:
+        data = {}
+    match args.verb:
+        case "get":
+            if args.key is None:
+                raise UsageFailure("get requires --key")
+            found, value = get_value(data, args.key)
+            if found:
+                print(format_value(value))
+            elif args.default is not None:
+                print(args.default)
+            else:
+                raise OperationFailure(f"missing key: {args.key}")
+        case "dump":
+            print(json.dumps(data, indent=2, sort_keys=True))
+        case unreachable:
+            usage(f"unsupported read command: {unreachable}")
+
+
+def run(argv: list[str]) -> int:
+    try:
+        args = parse_args(argv)
+        match args.verb:
+            case "get" | "dump":
+                read_command(args)
+            case "set" | "incr" | "del":
+                mutate(args)
+            case unreachable:
+                usage(f"unknown command: {unreachable}")
+    except UsageFailure as error:
+        usage(error.message)
+    except OperationFailure as error:
+        print(error.message, file=sys.stderr)
+        return 1
+    except CorruptStateFailure as error:
+        print(
+            f"corrupt state file {error.file_path}: {error.detail}; "
+            "move it aside before continuing",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run(sys.argv[1:]))

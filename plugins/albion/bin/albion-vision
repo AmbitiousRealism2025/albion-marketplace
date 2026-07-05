@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_MODEL="glm-4.6v"
+DEFAULT_PROMPT="Describe this image factually and completely."
+MAX_IMAGE_BYTES=5242880
+
+print_usage() {
+  cat <<'USAGE'
+Usage: albion-vision [--lane plan|api] [--model SLUG] [--prompt TEXT] <image-path>
+
+Describes a jpg, jpeg, or png image with GLM-4.6V over Z.ai HTTP.
+USAGE
+}
+
+resolve_script_dir() {
+  local source_path
+  local source_dir
+
+  source_path="${BASH_SOURCE[0]}"
+  while [ -h "$source_path" ]; do
+    source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+    source_path="$(readlink "$source_path")"
+    case "$source_path" in
+      /*) ;;
+      *) source_path="${source_dir}/${source_path}" ;;
+    esac
+  done
+
+  cd -P "$(dirname "$source_path")" && pwd
+}
+
+one_line() {
+  local text
+  text="$1"
+  text="${text//$'\n'/; }"
+  printf '%s' "$text"
+}
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+parse_args() {
+  local lane_was_set
+  lane_was_set=0
+
+  # Vision can use a different lane than the main model: ALBION_VISION_LANE wins
+  # over the general ALBION_AUTH_LANE (e.g. main model on a metered api key,
+  # vision on the plan lane, or vice versa). An explicit --lane still overrides.
+  if [ -n "${ALBION_VISION_LANE+x}" ]; then
+    auth_lane="${ALBION_VISION_LANE}"
+  elif [ -n "${ALBION_AUTH_LANE+x}" ]; then
+    auth_lane="${ALBION_AUTH_LANE}"
+  else
+    auth_lane="plan"
+  fi
+  model="$DEFAULT_MODEL"
+  prompt="$DEFAULT_PROMPT"
+  image_path=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --lane)
+        if [ "$#" -lt 2 ]; then
+          printf '%s\n' '--lane requires plan or api' >&2
+          print_usage >&2
+          exit 2
+        fi
+        auth_lane="$2"
+        lane_was_set=1
+        shift 2
+        ;;
+      --model)
+        if [ "$#" -lt 2 ]; then
+          printf '%s\n' '--model requires a slug' >&2
+          print_usage >&2
+          exit 2
+        fi
+        model="$2"
+        shift 2
+        ;;
+      --prompt)
+        if [ "$#" -lt 2 ]; then
+          printf '%s\n' '--prompt requires text' >&2
+          print_usage >&2
+          exit 2
+        fi
+        prompt="$2"
+        shift 2
+        ;;
+      --help)
+        print_usage
+        exit 0
+        ;;
+      --*)
+        printf 'unknown flag: %s\n' "$1" >&2
+        print_usage >&2
+        exit 2
+        ;;
+      *)
+        if [ -n "$image_path" ]; then
+          printf 'unexpected argument: %s\n' "$1" >&2
+          print_usage >&2
+          exit 2
+        fi
+        image_path="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [ "$lane_was_set" -eq 0 ]; then
+    case "$auth_lane" in
+      plan|api) ;;
+      *)
+        printf '%s\n' 'ALBION_AUTH_LANE must be plan or api; set ALBION_AUTH_LANE=plan or ALBION_AUTH_LANE=api.' >&2
+        exit 2
+        ;;
+    esac
+  fi
+
+  case "$auth_lane" in
+    plan|api) ;;
+    *)
+      printf '%s\n' '--lane must be plan or api' >&2
+      print_usage >&2
+      exit 2
+      ;;
+  esac
+
+  if [ -z "$image_path" ]; then
+    printf '%s\n' 'image path is required' >&2
+    print_usage >&2
+    exit 2
+  fi
+}
+
+resolve_token() {
+  # A dedicated vision credential wins over the lane's normal key. This covers
+  # the metered scenario: the main model runs on a funded api key while GLM-4.6V
+  # uses a separate key (or a different account) via ALBION_VISION_TOKEN.
+  if [ -n "${ALBION_VISION_TOKEN:-}" ]; then
+    auth_token="${ALBION_VISION_TOKEN}"
+    return 0
+  fi
+
+  case "$auth_lane" in
+    plan)
+      if [ -n "${ALBION_ZAI_PLAN_TOKEN+x}" ]; then
+        auth_token="${ALBION_ZAI_PLAN_TOKEN}"
+      elif [ -n "${ALBION_ZAI_TOKEN+x}" ]; then
+        auth_token="${ALBION_ZAI_TOKEN}"
+      else
+        auth_token=""
+      fi
+      if [ -z "$auth_token" ]; then
+        fail 'ALBION_ZAI_PLAN_TOKEN is unset or empty for lane=plan; set ALBION_ZAI_PLAN_TOKEN or fallback ALBION_ZAI_TOKEN.'
+      fi
+      ;;
+    api)
+      if [ -n "${ALBION_ZAI_API_KEY+x}" ]; then
+        auth_token="${ALBION_ZAI_API_KEY}"
+      elif [ -n "${ALBION_ZAI_TOKEN+x}" ]; then
+        auth_token="${ALBION_ZAI_TOKEN}"
+      else
+        auth_token=""
+      fi
+      if [ -z "$auth_token" ]; then
+        fail 'ALBION_ZAI_API_KEY is unset or empty for lane=api; set ALBION_ZAI_API_KEY or fallback ALBION_ZAI_TOKEN.'
+      fi
+      ;;
+  esac
+}
+
+validate_image() {
+  local extension
+
+  if [ ! -f "$image_path" ]; then
+    fail "image not found: ${image_path}"
+  fi
+
+  extension="${image_path##*.}"
+  if [ "$extension" = "$image_path" ]; then
+    extension=""
+  fi
+  extension="$(printf '%s' "$extension" | tr '[:upper:]' '[:lower:]')"
+
+  case "$extension" in
+    jpg|jpeg)
+      media_type="image/jpeg"
+      ;;
+    png)
+      media_type="image/png"
+      ;;
+    *)
+      fail 'unsupported image type; GLM-4.6V accepts jpg, jpeg, or png images.'
+      ;;
+  esac
+
+  if ! python3 - "$image_path" "$MAX_IMAGE_BYTES" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+max_bytes = int(sys.argv[2])
+raise SystemExit(0 if os.path.getsize(path) <= max_bytes else 1)
+PY
+  then
+    fail 'image is larger than 5MB; GLM-4.6V accepts jpg, jpeg, or png images up to 5MB.'
+  fi
+}
+
+build_payload() {
+  if ! python3 - "$auth_lane" "$model" "$prompt" "$image_path" "$media_type" "$payload_file" <<'PY'
+import base64
+import json
+import pathlib
+import sys
+
+lane, model, prompt, image_path, media_type, payload_path = sys.argv[1:7]
+data = base64.b64encode(pathlib.Path(image_path).read_bytes()).decode("ascii")
+
+if lane == "plan":
+    payload = {
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": data,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    }
+else:
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{data}",
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+pathlib.Path(payload_path).write_text(
+    json.dumps(payload, separators=(",", ":")),
+    encoding="utf-8",
+)
+PY
+  then
+    fail 'failed to build vision request payload'
+  fi
+}
+
+vision_curl() {
+  local curl_cmd
+  local url
+
+  curl_cmd="${ALBION_VISION_CURL:-curl}"
+
+  case "$auth_lane" in
+    plan)
+      url="https://api.z.ai/api/anthropic/v1/messages"
+      "$curl_cmd" \
+        --silent \
+        --show-error \
+        --connect-timeout 30 \
+        --max-time 120 \
+        --request POST \
+        "$url" \
+        --header "content-type: application/json" \
+        --header "Authorization: Bearer ${auth_token}" \
+        --header "anthropic-version: 2023-06-01" \
+        --data-binary "@${payload_file}" \
+        --write-out $'\n%{http_code}'
+      ;;
+    api)
+      url="https://api.z.ai/api/paas/v4/chat/completions"
+      "$curl_cmd" \
+        --silent \
+        --show-error \
+        --connect-timeout 30 \
+        --max-time 120 \
+        --request POST \
+        "$url" \
+        --header "content-type: application/json" \
+        --header "Authorization: Bearer ${auth_token}" \
+        --data-binary "@${payload_file}" \
+        --write-out $'\n%{http_code}'
+      ;;
+  esac
+}
+
+extract_description() {
+  local body
+
+  body="$1"
+
+  python3 - "$body" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    raise SystemExit(0)
+
+texts = []
+
+content = payload.get("content")
+if isinstance(content, list):
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text":
+            text = item.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+elif isinstance(content, str):
+    texts.append(content)
+
+choices = payload.get("choices")
+if isinstance(choices, list):
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        message_content = message.get("content")
+        if isinstance(message_content, str):
+            texts.append(message_content)
+        elif isinstance(message_content, list):
+            for item in message_content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
+
+print("\n".join(texts).strip())
+PY
+}
+
+extract_error_info() {
+  local body
+
+  body="$1"
+
+  python3 - "$body" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    print("")
+    print("")
+    raise SystemExit(0)
+
+error = payload.get("error")
+if not isinstance(error, dict):
+    error = payload
+
+code = error.get("code", "")
+message = error.get("message", "")
+
+print(str(code) if code is not None else "")
+print(str(message) if message is not None else "")
+PY
+}
+
+handle_http_error() {
+  local error_info
+  local error_code
+  local error_message
+  local detail
+
+  error_info="$(extract_error_info "$response_body")"
+  error_code="${error_info%%$'\n'*}"
+  if [ "$error_info" = "$error_code" ]; then
+    error_message=""
+  else
+    error_message="${error_info#*$'\n'}"
+  fi
+
+  if [ "$auth_lane" = "api" ] && [ "$http_status" = "429" ] && [ "$error_code" = "1113" ]; then
+    fail 'this token appears to be a Coding Plan token; plan tokens only work via --lane plan (/api/anthropic), or fund the account for the api lane.'
+  fi
+
+  if [ "$http_status" = "400" ] && [ "$error_code" = "1211" ]; then
+    fail "unknown model slug '${model}'; use glm-4.6v unless you have confirmed another Z.ai vision slug."
+  fi
+
+  detail="HTTP ${http_status}"
+  if [ -n "$error_code" ]; then
+    detail="${detail}: error code ${error_code}"
+  fi
+  if [ -n "$error_message" ]; then
+    if [ -n "$error_code" ]; then
+      detail="${detail}: ${error_message}"
+    else
+      detail="${detail}: ${error_message}"
+    fi
+  else
+    detail="${detail}: request failed"
+  fi
+
+  fail "$detail"
+}
+
+main() {
+  local script_dir
+  local response
+  local description
+
+  script_dir="$(resolve_script_dir)"
+  repo_root="$(cd "${script_dir}/.." && pwd)"
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/albion-vision.XXXXXX")"
+  payload_file="${tmp_dir}/payload.json"
+  curl_error_file="${tmp_dir}/curl.err"
+  auth_lane=""
+  auth_token=""
+  model=""
+  prompt=""
+  image_path=""
+  media_type=""
+  response_body=""
+  http_status=""
+
+  trap 'rm -rf "$tmp_dir"' EXIT
+
+  parse_args "$@"
+  resolve_token
+  validate_image
+  build_payload
+
+  if ! response="$(vision_curl 2>"$curl_error_file")"; then
+    fail "curl failed: $(one_line "$(cat "$curl_error_file")")"
+  fi
+
+  http_status="${response##*$'\n'}"
+  if [ "$http_status" = "$response" ]; then
+    fail 'curl response did not include an HTTP status'
+  fi
+  response_body="${response%$'\n'*}"
+
+  if [ "$http_status" != "200" ]; then
+    handle_http_error
+  fi
+
+  description="$(extract_description "$response_body")"
+  if [ -z "$description" ]; then
+    fail 'HTTP 200 response did not contain description text'
+  fi
+
+  printf '%s\n' "$description"
+
+  : "$repo_root"
+}
+
+main "$@"
