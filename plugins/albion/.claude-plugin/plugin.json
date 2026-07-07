@@ -1,7 +1,7 @@
 {
   "name": "albion",
-  "version": "0.2.0",
-  "description": "Run Claude Code on GLM-5.2 — launcher, always-on charter, and deterministic enforcement hooks.",
+  "version": "0.3.0",
+  "description": "Run Claude Code on GLM-5.2 \u2014 launcher, always-on charter, and deterministic enforcement hooks.",
   "author": {
     "name": "AmbitiousRealism2025"
   }

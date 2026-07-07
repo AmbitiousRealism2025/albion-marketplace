@@ -9,7 +9,7 @@
       "name": "albion",
       "source": "./plugins/albion",
       "description": "Run Claude Code on GLM-5.2 — launcher, always-on charter, and deterministic enforcement hooks. Coexists with stock Claude Code.",
-      "version": "0.2.0"
+      "version": "0.3.0"
     }
   ]
 }

@@ -176,6 +176,40 @@ def empty_verification_tasks(root: Path) -> list[str]:
     return missing
 
 
+def strip_fenced_code_blocks(text: str) -> str:
+    kept_lines: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if re.match(r"^\s*```", line):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            kept_lines.append(line)
+    return "\n".join(kept_lines)
+
+
+def unchecked_deliverable_tasks(root: Path) -> list[tuple[str, int]]:
+    fable_root = root / "fable-mode"
+    if not fable_root.is_dir():
+        return []
+
+    unchecked: list[tuple[str, int]] = []
+    checkbox_pattern = re.compile(r"(?m)^\s*[-*]\s+\[ \](?:\s|$)")
+    for task_dir in sorted(path for path in fable_root.iterdir() if path.is_dir()):
+        task_file = task_dir / "task.md"
+        try:
+            task_text = task_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not task_is_nontrivial(task_text):
+            continue
+
+        count = len(checkbox_pattern.findall(strip_fenced_code_blocks(task_text)))
+        if count > 0:
+            unchecked.append((task_dir.name, count))
+    return unchecked
+
+
 tasks = state.get("tasks")
 open_tasks = open_task_count(tasks.get("open") if isinstance(tasks, dict) else None)
 
@@ -189,6 +223,7 @@ last_test_failed = isinstance(last_test, dict) and normalized_status(last_test.g
 last_test_command = string_value(last_test.get("command") if isinstance(last_test, dict) else None)
 
 missing_verification = empty_verification_tasks(workbench_root)
+unchecked_deliverables = unchecked_deliverable_tasks(workbench_root)
 
 reasons: list[str] = []
 if open_tasks > 0:
@@ -209,12 +244,16 @@ if not stop_hook_active:
         else:
             task_names = ", ".join(f"`{name}`" for name in missing_verification)
             reasons.append(f"verification.md missing or empty for workbench tasks: {task_names}")
+    for task_name, unchecked_count in unchecked_deliverables:
+        reasons.append(
+            f"{unchecked_count} unchecked deliverable(s) in task.md for workbench task `{task_name}`"
+        )
 
 claim_pattern = re.compile(r"\b(done|complete|completed|fixed|passing)\b|all tests pass", re.IGNORECASE)
 if (
     not stop_hook_active
     and claim_pattern.search(last_assistant_message)
-    and (last_test_failed or missing_verification)
+    and (last_test_failed or missing_verification or unchecked_deliverables)
 ):
     reasons.append("last assistant message claimed completion while test or verification state is unresolved")
 

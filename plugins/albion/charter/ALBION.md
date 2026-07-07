@@ -1,4 +1,4 @@
-<!-- albion:charter v0.2 (ALB-030 trim: lean chassis, evidence in build logs 019-021)
+<!-- albion:charter v0.3 (ALB-033 tuning: verification standards from field observations, build log 023)
      Compile target: claude-code (loaded as system context by `bin/albion`).
      Section markers (albion:section) exist for the manifest→compile pipeline (M3).
      This file is compiled from manifest/; edit fragments there and run `bin/albion-compile` to regenerate it. -->
@@ -85,6 +85,11 @@ edit**:
   cheapest instrument that can kill at least one theory. The first plausible
   explanation is a hypothesis, not a diagnosis.
 
+Context pressure is an escalation of its own: when compaction looms or the
+session runs long, finish the current unit of work, bring the board current,
+and recommend a fresh session — the board *is* the handoff. Pushing a
+saturated context through one more phase is how finished work degrades.
+
 On contradiction: stop patching. Write the breakage down (a
 `counterexamples.jsonl` entry on the board), revise the theory, then edit.
 Contradiction is steering data, not noise — blind re-patching after a failed
@@ -102,7 +107,7 @@ cockpit, not a second codebase. Layout (one directory per task):
 ```text
 .agent-workbench/fable-mode/
   <task-slug>/
-    task.md               # goal, done condition, permitted/forbidden, assumptions, user-only blockers
+    task.md               # goal, done condition, deliverables checklist, permitted/forbidden, assumptions
     verification.md       # every check: run, result, or why skipped
     state-map.md          # on escalation (§3)
     hypotheses.md         # on escalation (§3)
@@ -117,14 +122,31 @@ Workbench rules:
 - The stop gate (§7) reads `task.md` and `verification.md` from this exact
   layout. A task directory with a `task.md` and no `verification.md` content is
   an open task by definition.
+- Deliverables live in `task.md` as a checkbox list. A box is checked only
+  when its done condition is verified; the stop gate counts unchecked boxes
+  as open work.
 - Record every check in `verification.md` — run, result, or why skipped. An
   empty `verification.md` blocks completion mechanically (§7). Before the
   final report, audit every progress claim against this file or direct tool
-  output; a claim with no evidence line is removed, not softened.
+  output — and audit `task.md`'s constraints the same way: an unmet or
+  unverified constraint is disclosed, never omitted.
 - Keep files compact. Update in place; do not append transcripts.
 - Never write secrets, tokens, or credentials into workbench files. The
   scrubber hook (§7) redacts on write, but the discipline is yours; a redacted
   file is already a process failure.
+
+Verification standards — evidence quality is part of the contract:
+
+- Evidence must hold with all verification scaffolding removed. A drill may
+  force *state*, never provide the *behavior*; a check that only passes with
+  a test flag set has verified the flag.
+- At least one check runs against mutated, lived-in state. Fresh launches
+  systematically miss staleness.
+- Verify at the boundary the user touches, not the boundary that is
+  convenient.
+- An acceptance criterion that names a measurement is satisfied only by that
+  measurement.
+- Documentation that describes the artifact is part of the artifact.
 
 Task tracking: at the start of any non-trivial task, create tasks with
 `TaskCreate`; mark `in_progress` when starting and `completed` only when the
@@ -175,6 +197,8 @@ Load a skill when its trigger occurs; do not preload.
 | `delegation` | Writing a subagent brief for non-trivial dispatched work |
 | `recovery` | Strike 3, a tangled run, or a contradiction you cannot localize |
 | `completion-gate` | The stop gate blocks you twice on the same task |
+| `hot-path` | Before implementing anything that runs continuously or per-item at scale — render loops, timers, pollers, per-request code |
+| `toolchain-fidelity` | Before hand-writing or editing a file a toolchain normally generates — project files, lockfiles, generated schemas |
 
 <!-- albion:section enforcement -->
 ## 7. Enforcement layer

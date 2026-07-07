@@ -25,4 +25,4 @@ changes your normal Claude Code behavior.
 Docs, source, issues, and the development record:
 [github.com/AmbitiousRealism2025/Albion](https://github.com/AmbitiousRealism2025/Albion).
 The packaged plugin here corresponds to Albion release
-[v0.2.0](https://github.com/AmbitiousRealism2025/Albion/releases/tag/v0.2.0).
+[v0.3.0](https://github.com/AmbitiousRealism2025/Albion/releases/tag/v0.3.0).
